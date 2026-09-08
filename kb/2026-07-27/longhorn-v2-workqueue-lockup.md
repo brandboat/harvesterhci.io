@@ -11,13 +11,13 @@ tags: [longhorn, storage, v2 data engine, troubleshooting]
 hide_table_of_contents: false
 ---
 
-After enabling the Longhorn V2 Data Engine in Harvester, some nodes may report kernel workqueue lockups and become unstable. In severe cases, `rke2-server` may terminate, Longhorn may stop making progress, and the node may require recovery.
+Enabling the Longhorn V2 Data Engine can cause kernel workqueue lockups on some Harvester nodes, leading to system instability. In severe cases, `rke2-server` terminates, Longhorn stops processing operations, and affected nodes require recovery.
 
-This issue is most likely to occur when SPDK is pinned to dedicated CPUs, but the Linux kernel is still allowed to run IRQ handlers or unbound workqueue workers on those same CPUs.
+This issue typically occurs when SPDK is pinned to dedicated CPUs, but the Linux kernel continues running IRQ handlers or unbound workqueue workers on those same CPUs.
 
 :::caution
 
-The mitigation described in this article changes host CPU affinity for IRQs and kernel workqueues. These settings are node-wide and can affect every workload on the node. Apply the workaround only to nodes that run the Longhorn V2 Data Engine, and validate the CPU mask carefully before changing any host settings.
+The mitigation measure described in this article modifies node-wide host CPU affinity for IRQs and kernel workqueues, which can affect all workloads running on the host. Apply this workaround only to nodes running the Longhorn V2 Data Engine, and carefully validate your target CPU mask before making host-level changes.
 
 :::
 
@@ -26,25 +26,25 @@ The mitigation described in this article changes host CPU affinity for IRQs and 
 This issue can affect Harvester clusters that meet all of the following conditions:
 
 - The Longhorn V2 Data Engine is enabled.
-- The Longhorn V2 instance-manager pod runs SPDK (`spdk_tgt`), which busy-polls on the CPUs selected by the Longhorn V2 data engine CPU mask.
-- Host IRQ handling or unbound kernel workqueues are still allowed to run on the same busy CPUs used by `spdk_tgt`.
+- The Longhorn V2 `instance-manager` pod runs SPDK (`spdk_tgt`), which busy-polls the CPUs specified in the Longhorn V2 Data Engine CPU mask.
+- Host IRQ handlers or unbound kernel workqueues are permitted to run on those same SPDK-designated CPUs.
 
-The default Longhorn V2 CPU mask is `0x3`, which maps to CPUs `0` and `1`. However, the issue is not limited to CPUs `0` and `1`; it can occur with any CPU mask if kernel IRQs or unbound workqueues still run on the CPUs occupied by `spdk_tgt`.
+While the default Longhorn V2 CPU mask is `0x3` (maps to CPUs `0` and `1`), this issue can occur with any CPU mask if kernel IRQs or unbound workqueues share the CPUs used by `spdk_tgt`.
 
-The issue was observed on bare-metal Harvester nodes with Longhorn V2 enabled. It is not always reproducible in every environment.
+This issue primarily affects bare-metal Harvester nodes running the Longhorn V2 Data Engine. Reproducibility varies depending on hardware and workload patterns.
 
 ## Symptoms
 
-Affected nodes may show one or more of the following symptoms:
+Affected nodes may exhibit one or more of the following symptoms:
 
-- Kernel logs repeatedly contain `BUG: workqueue lockup`.
-- The lockup is reported on a CPU that is part of the Longhorn V2 data engine CPU mask.
+- Kernel logs repeatedly report `BUG: workqueue lockup`.
+- The lockup message references a CPU core assigned to the Longhorn V2 Data Engine CPU mask.
 - `rke2-server` becomes unstable or terminates without a clear user-visible reason.
 - Longhorn volumes, engines, replicas, or instance managers stop progressing.
-- User switching commands, such as `sudo -i`, may become very slow before the root shell appears.
+- Interactive user commands, such as `sudo -i`, experience severe latency before opening a shell.
 - The node becomes unstable or unhealthy.
 
-Example kernel message:
+Example of kernel log records:
 
 ```text
 Jul 27 07:27:55 hp-114-tink-system kernel: BUG: workqueue lockup - pool cpus=0 node=0 flags=0x0 nice=0 stuck for 2117s!
@@ -66,17 +66,17 @@ Jul 27 07:28:12 hp-114-tink-system rke2[2909320]: time="2026-07-27T07:28:12Z" le
 
 ## Root Cause
 
-Longhorn V2 uses SPDK. SPDK reactor threads are designed to busy-poll on the CPUs selected by the Longhorn V2 data engine CPU mask. This is expected for high-performance storage I/O.
+The Longhorn V2 Data Engine relies on SPDK, whose reactor threads busy-poll on the CPUs designated by the engine's CPU mask. This continuous polling is expected behavior for high-performance storage processing.
 
-The problem occurs when normal host kernel work is also allowed to run on those same CPUs. For example:
+The issue occurs when normal host kernel work continues running on those same CPUs, including the following:
 
-- NIC or storage IRQs may still target the SPDK CPUs.
-- Unbound kernel workqueues may still include the SPDK CPUs in `/sys/devices/virtual/workqueue/cpumask`.
-- Per-workqueue CPU masks may still allow existing workers to run on the SPDK CPUs.
+- Network or storage IRQs target SPDK CPUs.
+- Unbound kernel workqueues retain SPDK CPUs in `/sys/devices/virtual/workqueue/cpumask`.
+- Per-workqueue CPU masks allow existing workers to run on SPDK CPUs.
 
-When SPDK fully occupies those CPUs, kernel workers can be delayed long enough for the kernel workqueue lockup detector to fire. Short or occasional workqueue lockup reports do not always mean the node is unrecoverable. The operational problem is when the delayed kernel work keeps accumulating and cascades into networking, RKE2, kubelet, and Longhorn instability.
+When SPDK consumes 100% of these CPU cores, pending kernel tasks are starved, eventually triggering the kernel workqueue lockup detector. While isolated lockup warnings may not always result in an unrecoverable node, continuous task starvation cascades into network, RKE2, kubelet, and Longhorn control-plane failure.
 
-For example, if the Longhorn V2 CPU mask is the default value `0x3`, SPDK uses CPUs `0` and `1`. IRQs and kernel workqueues should be moved away from CPUs `0` and `1`.
+To prevent this, all IRQs and kernel workqueues must be explicitly re-routed away from the CPUs defined in the Longhorn V2 CPU mask (for example, CPUs `0` and `1` when using the default mask `0x3`).
 
 ## Confirming the Issue
 
